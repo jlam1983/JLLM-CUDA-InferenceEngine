@@ -1,4 +1,4 @@
-# JLLM-CUDA-InferenceEngine 🚀
+# JLLM-CUDA-InferenceEngine （beta)🚀
 
 一個基於 **Python + Pure CUDA (CuPy & PyTorch)** 打造的輕量化、工業級大模型（LLM）動態流式推理引擎。專為消費級顯示卡（如 NVIDIA RTX 3060 12GB）進行極致優化，支援 Llama 3 與 DeepSeek 等主流的 SwiGLU / GQA 架構模型。
 
