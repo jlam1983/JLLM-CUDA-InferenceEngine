@@ -1,218 +1,522 @@
-import cupy as cp
-import numpy as np
-from transformers import AutoTokenizer
+"""
+JLLM Inference Engine - Core Logic
+===================================
+Main inference engine shared by GPU and CPU modes.
+"""
+
+import gc
 import torch
-import math
-from src.JMultiHeadAttention import *
+import os
+import shutil
+
+from JLLMLoader import JLLMLoader
+from JLLMExtractor import JLLMExtractor
+from JLLMFileCacheConverter import JLLMFileCacheConverter
+from JLLMTransformerLayer import (    
+    apply_transformer_layer,
+    transformer_layer_forward_cell,
+    rms_norm_cell,
+    compute_rope_freqs as compute_rope_freqs_cell,
+)
+from JLLMMultiHeadAttention import *
+from JLLMStreamPrefetcher import *
+
+# Alias for backward compatibility
+rms_norm = rms_norm_cell
+
+
+
+def mask_logits(logits_t, vocab_size, special_token_ids):
+    """Mask OOV tokens and special tokens in logits before sampling.
+
+    Args:
+        logits_t: Logits tensor [..., vocab]
+        vocab_size: Tokenizer vocabulary size (tokens >= this are OOV)
+        special_token_ids: List of special token IDs to mask
+    """
+    mask = torch.zeros_like(logits_t)
+    # Mask OOV tokens (beyond tokenizer vocab)
+    mask[..., vocab_size:] = float('-inf')
+    # Mask special tokens
+    for sid in special_token_ids:
+        if sid < logits_t.shape[-1]:
+            mask[..., sid] = float('-inf')
+    return logits_t + mask
+
+
+def sample_token(logits_t, vocab_size, special_token_ids):
+    """Sample next token after masking OOV and special tokens."""
+    masked_logits = mask_logits(logits_t, vocab_size, special_token_ids)
+    return masked_logits.argmax(dim=-1)
+
+# =============================================================================
+# Transformer Layer Application
+# =============================================================================
+# Tensor Alignment Utilities
+# =============================================================================
+
+def find_tensor_name(tensor_names, pattern):
+    return next((k for k in tensor_names if pattern in k), None)
+
+def align_tensor_names(all_tensor_names):
+    return {
+        "embed": find_tensor_name(all_tensor_names, "embed_tokens") or "embed_tokens.weight",
+        "norm": find_tensor_name(all_tensor_names, "model.norm") or find_tensor_name(all_tensor_names, "ln_f") or "norm.weight",
+        "lm_head": find_tensor_name(all_tensor_names, "lm_head") or "lm_head.weight"
+    }
+
+def clear_storage_dir(storage_dir):
+    if os.path.exists(storage_dir):
+        shutil.rmtree(storage_dir)
+        print(f"[Cache] Cleared {storage_dir}.")
+    os.makedirs(storage_dir, exist_ok=True)
+
+# =============================================================================
+# Main Inference Engine Class
+# =============================================================================
 
 class JLLMInferenceEngine:
-    def __init__(self, loader, cacher, tokenizer_path, run_device="cuda", max_new_tokens=20):
-        self.loader = loader
-        self.device = run_device
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
-        self.cacher = cacher
-        self.num_layers = self.cacher.num_layers
-        self.max_new_tokens = max_new_tokens
-        
-        # 預建注意力機制算子
-        self.attn_layers = [
-            JMultiHeadAttention(self.loader, self.cacher, layer_idx, num_heads=32, head_dim=128)
-            for layer_idx in range(self.num_layers)
-        ]
-        self.kv_caches = [None] * self.num_layers
-        
-        # 🎯【核心大修正】：開機時不再一口氣 record_weight()！保持顯存完美淨空！
-        print(f"🎬 JLLM 智能動態推理引擎已啟動！開機顯存佔用：0 MB。")
+    def __init__(self, model_path, tokenizer, storage_dir="./cache_store", device="cuda", cache_mode="full_gpu", determinism_mode="fast"):
+        self.device = device
+        self.model_path = model_path
+        self.storage_dir = storage_dir
+        self.cache_mode = cache_mode
+        self.determinism_mode = determinism_mode
 
-    def to_cupy(self, torch_tensor):
-        """標準高能橋樑：將 Torch Tensor 0 複製轉換為 CuPy Array"""
-        if torch_tensor is None:
-            return None
-        # 使用 dlpack 實現完美的 GPU 記憶體共享，不發生 PCIe 搬運
-        return cp.from_dlpack(torch.utils.dlpack.to_dlpack(torch_tensor.contiguous()))
+        # Apply determinism settings before any computation
+        self._apply_determinism(determinism_mode)
 
-    def to_torch(self, cupy_array, dtype=torch.float16):
-        """標準高能橋樑：將 CuPy Array 0 複製轉換為 Torch Tensor"""
-        if cupy_array is None:
-            return None
-        return torch.utils.dlpack.from_dlpack(cupy_array.toDlpack()).to(device=self.device, dtype=dtype)
+        self.loader = JLLMLoader(model_path, tokenizer=tokenizer)
+        for layer_idx in range(28):
+            self.loader.tensorManager.preload_layer(layer_idx, self.loader)
+        self.tokenizer = self.loader.tokenizer
 
-    def rms_norm(self, x_cp, weight_cp, eps=1e-5):
+        self.extractor = JLLMExtractor()
+        self.cacher = JLLMFileCacheConverter(storage_dir=storage_dir, run_device=self.device)
+        self.prefetcher = JLLMStreamPrefetcher(run_device=self.device)
+        self.attention_layer = JLLMMultiHeadAttention(self.loader, self.cacher)
+
+        self._auto_detect_architecture()
+
+        self.window_size = 256
+        self.max_new_tokens = 100
+
+        # High-Speed Weight Caching
+        self.weight_cache = {}
+        self.gpu_kv_cache = {}
+        self.kv_cache = {}
+
+        print(f"[JLLM] Engine initialized. Mode: {cache_mode}, Determinism: {determinism_mode}")
+        print(f"   Architecture: hidden={self.hidden_size}, heads={self.num_heads}, layers={self.num_layers}, kv_heads={self.num_kv_heads}")
+
+    def _apply_determinism(self, mode):
+        """Apply determinism settings based on mode.
+
+        Modes:
+            fast - No constraints, fastest execution (default)
+            deterministic - Force CUDA deterministic algorithms
+            strict        - CPU fallback for full reproducibility
         """
-        究極穩定版：混合精度 RMSNorm，防範 FP16 平方溢出
-        修正：將 PyTorch 專屬的 cp.rsqrt 改為相容的 CuPy 倒數平方根計算
-        """
-        # 1. 在計算平方和均值時，強行升級到 FP32 確保絕不溢出
-        variance = cp.mean(x_cp.astype(cp.float32) ** 2, axis=-1, keepdims=True)
-        
-        # 2. 🎯【核心修正】：消滅 cp.rsqrt，改用 1 / cp.sqrt() 完美替代
-        # 算完開根號倒數後，再降回 float16 與原矩陣相乘
-        rsqrt_cp = 1.0 / cp.sqrt(variance + eps)
-        x_cp = x_cp * rsqrt_cp.astype(cp.float16)
-        
-        # 3. 顯式對齊廣播維度，防止底層 CUDA 核心發生 Strides 錯位導致亂碼
-        if x_cp.ndim == 3 and weight_cp.ndim == 1:
-            return x_cp * weight_cp[None, None, :]
-        elif x_cp.ndim == 2 and weight_cp.ndim == 1:
-            return x_cp * weight_cp[None, :]
-            
-        return x_cp * weight_cp
+        if mode == "fast":
+            # Default behavior — fastest, may be non-deterministic
+            if self.device.startswith("cuda"):
+                torch.backends.cudnn.deterministic = False
+                torch.backends.cudnn.benchmark = True
+            print(f"[Determinism] Mode: fast (no constraints)")
 
-    def generate_stream(self, prompt: str):
-        # 1. Tokenize 入口
-        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
-        current_input_ids_cp = cp.asarray(input_ids.cpu().numpy(), dtype=cp.int32)
+        elif mode == "deterministic":
+            # Force deterministic algorithms where supported
+            if self.device.startswith("cuda"):
+                torch.backends.cudnn.deterministic = True
+                torch.backends.cudnn.benchmark = False
+                torch.use_deterministic_algorithms(True)
+            print(f"[Determinism] Mode: deterministic (forced deterministic CUDA algorithms)")
 
-        # 🎯【智慧型名稱對齊】：自動從 Loader 搜出真實的全名，徹底解決 "model not found"
+        elif mode == "strict":
+            # Full CPU fallback for reproducibility
+            self.device = "cpu"
+            print(f"[Determinism] Mode: strict (CPU fallback for full reproducibility)")
+            print(f"[Warning] Running on CPU — significantly slower")
+
+        else:
+            raise ValueError(f"Unknown determinism_mode: {mode}. Must be 'fast', 'deterministic', or 'strict'.")
+
+    def _get_special_token_ids(self):
+        """Get list of special token IDs to mask during generation."""
+        special_ids = set()
+        tok = self.tokenizer
+        # Collect all defined special token IDs
+        if tok.pad_token_id is not None:
+            special_ids.add(tok.pad_token_id)
+        if tok.eos_token_id is not None:
+            special_ids.add(tok.eos_token_id)
+        if tok.bos_token_id is not None:
+            special_ids.add(tok.bos_token_id)
+        if tok.unk_token_id is not None:
+            special_ids.add(tok.unk_token_id)
+        # Also mask the extra special tokens (151643-151645) that exist in model but not tokenizer vocab
+        vocab_size = tok.vocab_size
+        for sid in range(vocab_size, vocab_size + 500):
+            if sid >= self.loader.header.get("architecture", {}).get("vocab_size", vocab_size + 500):
+                break
+            # Mask if it looks like a special token (decode test)
+            try:
+                decoded = tok.decode([sid])
+                if decoded.startswith("<|") and decoded.endswith("|>"):
+                    special_ids.add(sid)
+            except Exception:
+                pass
+        return list(special_ids)
+
+    def _auto_detect_architecture(self):
+        arch = self.loader.header.get("architecture", {})
+        if arch and all(k in arch for k in ['hidden_size', 'num_hidden_layers', 'num_attention_heads']):
+            self.hidden_size = arch['hidden_size']
+            self.num_layers = arch['num_hidden_layers']
+            self.num_heads = arch['num_attention_heads']
+            self.num_kv_heads = arch['num_key_value_heads']
+            self.rope_theta = arch.get('rope_theta', 10000.0)
+        else:
+            self._detect_from_tensors()
+
+        self.attention_layer.hidden_size = self.hidden_size
+        self.attention_layer.num_heads = self.num_heads
+        self.attention_layer.num_kv_heads = self.num_kv_heads
+        self.attention_layer.rope_theta = getattr(self, 'rope_theta', 10000.0)
+
+    def _detect_from_tensors(self):
+        tensors = self.loader.header["tensors"]
+        embed_shape = next((tensors[n]["shape"] for n in tensors if "embed_tokens" in n), None)
+        self.hidden_size = embed_shape[1] if (embed_shape and "shape" in embed_shape) else 4096
+
+        layer_nums = {int(name.split(".")[1]) for name in tensors if name.startswith("layers.") and name.split(".")[1].isdigit()}
+        self.num_layers = len(layer_nums) if layer_nums else 28
+
+        q_proj_shape = next((tensors[n]["shape"] for n in tensors if "self_attn.q_proj.weight" in n), None)
+        k_proj_shape = next((tensors[n]["shape"] for n in tensors if "self_attn.k_proj.weight" in n), None)
+
+        if q_proj_shape and k_proj_shape:
+            self.num_heads = q_proj_shape[0] // 128
+            self.num_kv_heads = k_proj_shape[0] // 128
+        else:
+            self.num_heads, self.num_kv_heads = 32, 8
+        self.rope_theta = 10000.0
+
+    def _get_cached_weight(self, name, target_dtype=torch.float16):
+        if name not in self.weight_cache:
+            weight = self.loader.get_matrix(name, target_device=self.device)
+            if weight is None:
+                raise RuntimeError(f"[Engine] Error: Weight matrix {name} not found!")
+            self.weight_cache[name] = weight.to(target_dtype)
+        return self.weight_cache[name]
+
+    def prefill_and_freeze_context(self, prompt_tokens, system_kv=None):
+        clear_storage_dir(self.storage_dir)
+        self.gpu_kv_cache.clear()
+
+        if system_kv is not None:
+            self.cacher.save_global_root_cache(system_kv["k"], system_kv["v"])
+
+        current_seq_len = len(prompt_tokens)
         all_tensor_names = list(self.loader.header["tensors"].keys())
-        
-        # 模糊匹配搜尋入口 Embedding 真實名稱
-        real_embed_name = next((k for k in all_tensor_names if "embed_tokens" in k), "embed_tokens.weight")
-        # 模糊匹配搜尋出口 Final Norm 真實名稱
-        real_norm_name = next((k for k in all_tensor_names if "norm.weight" in k or ("model.norm" in k)), "norm.weight")
-        # 模糊匹配搜尋出口 LM Head 真實名稱
-        real_lm_head_name = next((k for k in all_tensor_names if "lm_head" in k), "lm_head.weight")
+        tensor_names = align_tensor_names(all_tensor_names)
 
-        print(f"🔍 智慧型硬體名稱對齊成功：")
-        print(f" ┠─ 入口 Embedding: {real_embed_name}")
-        print(f" ┠─ 出口 Final Norm: {real_norm_name}")
-        print(f" ┠─ 出口 LM Head: {real_lm_head_name}")
-        print(f"\n💬 使用者輸入: {prompt}")
-        print("🧠 JLLM 智能動態推理引擎流式生成中...\n" + "─" * 80)
+        # Pre-save all layer caches (one file per layer) before transformer loop
+        for layer_idx in range(self.num_layers):
+            cache_path = self.loader.tensorManager._layer_cache_path(layer_idx)
+            if not (os.path.exists(cache_path + ".bin") and os.path.exists(cache_path + ".meta.pt")):
+                print(f"[JLLM] Saving layer {layer_idx} cache...")
+                self.loader.tensorManager.save_layer_cache(layer_idx, self.loader)
+
+        input_ids_t = torch.tensor(prompt_tokens, dtype=torch.long, device=self.device)[None, :]
+
+        embed_w = self._get_cached_weight(tensor_names["embed"])
+        hidden_t = embed_w[input_ids_t]
+
+        for layer_idx in range(self.num_layers):
+            hidden_t, new_kv = apply_transformer_layer(
+                layer_idx, hidden_t, self.loader, self.attention_layer, self.device, current_seq_len
+            )
+            new_k, new_v = new_kv
+
+            if self.cache_mode == "full_gpu":
+                self.gpu_kv_cache[layer_idx] = (new_k.contiguous(), new_v.contiguous())
+            else:
+                self.cacher.save_layer_compressed_cache(layer_idx, new_k, new_v)
+
+        torch.cuda.empty_cache()
+        print("[JLLM] Prefill complete. System context pinned.")
+
+    def generate_stream(self, prompt: str, target_context_window=None):
+        input_ids = self.tokenizer.encode(prompt, return_tensors="pt").to(self.device)
+        prompt_tokens = input_ids[0].tolist()
+        current_input_ids_t = input_ids
+        current_seq_len = current_input_ids_t.shape[1]
+
+        all_tensor_names = list(self.loader.header["tensors"].keys())
+        tensor_names = align_tensor_names(all_tensor_names)
+
+        if self.cache_mode != "full_gpu":
+            self.prefill_and_freeze_context(prompt_tokens=prompt_tokens)
+
+        print(f"\n[JLLM] Input: {prompt}")
+        print(f"[JLLM] Starting engine phase [{self.cache_mode}]...\n" + "-" * 60)
+
+        with torch.no_grad():
+            if self.cache_mode == "full_gpu":
+                self._generate_full_gpu(current_input_ids_t, current_seq_len, tensor_names)
+            elif self.cache_mode == "1_3_gpu" or self.cache_mode == "1/3_gpu":
+                self._generate_1on3_gpu(current_input_ids_t, current_seq_len, tensor_names)
+            elif self.cache_mode == "no_cache":
+                self._generate_no_cache(current_input_ids_t, current_seq_len, tensor_names)
+            elif self.cache_mode == "cell":
+                self._generate_cell_level(current_input_ids_t, current_seq_len, tensor_names)
+
+        print("\n" + "-" * 60 + "\n[JLLM] Generation complete!")
+
+    def _generate_full_gpu(self, current_input_ids_t, current_seq_len, tensor_names):
+        embed_w = self._get_cached_weight(tensor_names["embed"])
+        hidden_t = embed_w[current_input_ids_t]
+
+        # Prefill pass logic
+        for layer_idx in range(self.num_layers):
+            hidden_t, new_kv = apply_transformer_layer(
+                layer_idx, hidden_t, self.loader, self.attention_layer, self.device, current_seq_len
+            )
+            self.kv_cache[layer_idx] = (new_kv[0].contiguous(), new_kv[1].contiguous())
+
+        final_norm_w = self._get_cached_weight(tensor_names["norm"])
+        hidden_norm = rms_norm(hidden_t, final_norm_w)
+
+        lm_head_w = self._get_cached_weight(tensor_names["lm_head"])
+        logits_t = torch.matmul(hidden_norm[:, -1:, :], lm_head_w.T)
+
+        vocab_size = self.tokenizer.vocab_size
+        special_ids = self._get_special_token_ids()
+        next_token_id_t = sample_token(logits_t, vocab_size, special_ids)
+
+        token_id = int(next_token_id_t[0, 0])
+        print(self.tokenizer.decode([token_id]), end="", flush=True)
+
+        # Autoregressive Decode Pass
+        for step in range(self.max_new_tokens - 1):
+            current_seq_len += 1
+            hidden_t = embed_w[next_token_id_t]
+
+            for layer_idx in range(self.num_layers):
+                history_k, history_v = self.kv_cache[layer_idx]
+                
+                hidden_t, new_kv = apply_transformer_layer(
+                    layer_idx, hidden_t, self.loader, self.attention_layer, self.device, current_seq_len,
+                    raw_flat_kv=(history_k, history_v)
+                )
+                
+                # ====== SMART APPEND FIX (Amnesia Fix) ======
+                new_k, new_v = new_kv[0], new_kv[1]
+                if new_k.shape[1] == 1:
+                    k_full = torch.cat([history_k, new_k], dim=1)
+                    v_full = torch.cat([history_v, new_v], dim=1)
+                else:
+                    k_full, v_full = new_k, new_v
+                    
+                self.kv_cache[layer_idx] = (k_full.contiguous(), v_full.contiguous())
+
+            hidden_norm = rms_norm(hidden_t, final_norm_w)
+            logits_t = torch.matmul(hidden_norm, lm_head_w.T)
+
+            next_token_id_t = sample_token(logits_t, vocab_size, special_ids)
+            token_id = int(next_token_id_t[0, 0])
+
+            if token_id == self.tokenizer.eos_token_id:
+                break
+
+            print(self.tokenizer.decode([token_id]), end="", flush=True)
+
+    def _generate_1on3_gpu(self, current_input_ids_t, current_seq_len, tensor_names):
+        self.cacher.read_only = True
+        embed_w = self._get_cached_weight(tensor_names["embed"])
+        final_norm_w = self._get_cached_weight(tensor_names["norm"])
+        lm_head_w = self._get_cached_weight(tensor_names["lm_head"])
+
+        n = self.num_layers
+        group_size = max(1, n // 3)
+        groups = [list(range(0, group_size)), list(range(group_size, group_size * 2)), list(range(group_size * 2, n))]
+        
+        kv_queue = []
+        next_token_id_t = current_input_ids_t[:, -1:] if current_input_ids_t.shape[1] > 1 else current_input_ids_t
+        vocab_size = self.tokenizer.vocab_size
+        special_ids = self._get_special_token_ids()
 
         for step in range(self.max_new_tokens):
-            
-            # ====================== 1. Embedding 動態加載 ======================
-            # 🎯【核心修正】：使用模糊搜索出來的 real_embed_name 進行加載
-            # ====================== 1. Embedding 動態加載 ======================
-            embed_weight = self.loader.get_matrix(real_embed_name, self.device)
-            if embed_weight is not None:
-                # 智慧型防禦橋樑：自動識別 Embedding 型態，0 複製安全轉換
-                if hasattr(embed_weight, "contiguous"):  # PyTorch
-                    embed_weight_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(embed_weight.contiguous()))
-                elif isinstance(embed_weight, cp.ndarray): # CuPy
-                    embed_weight_cp = cp.ascontiguousarray(embed_weight)
-                else:  # NumPy
-                    embed_weight_cp = cp.ascontiguousarray(cp.asarray(embed_weight))
+            end_window = current_seq_len // self.cacher.interval
+            start_window = max(0, end_window - self.window_size)
 
-                # 壓縮雜湊註冊
-                weights_bucket, keys = self.cacher._process_and_hash_weight(embed_weight_cp)
-                
-                # 🎯【核心修正】：成對登記！同時將 1D Keys 和 硬體資料安全桶（Bucket）塞進快取導航庫中
-                self.cacher.weight_caches["embed_tokens.weight"] = {"0": keys}
-                self.cacher.bucket_caches["embed_tokens.weight"] = {"0": weights_bucket} # 👈 補上這行，徹底摧毀 KeyError！
-                
-                # 此時 Cacher.get 就能完美從 bucket_caches 撈到反向地圖，發動 0 毫秒物理膨脹
-                embed_flat_cp = self.cacher.get("embed_tokens.weight", "0", target_device=self.device)
-                
-                # 重塑回模型原本的 Embedding 矩陣形狀
-                vocab_size = embed_weight.shape[0] if hasattr(embed_weight, "shape") else 128256
-                embed_matrix_cp = embed_flat_cp.reshape(vocab_size, -1)
-                
-                # 全 GPU 內部高效查表
-                hidden_cp = embed_matrix_cp[current_input_ids_cp]
-                
-                # 計算完畢立刻就地清空 Embedding 顯存，保持 0 MB 閒置
-                self.cacher.clear_single_layer("0")
-                del embed_weight, embed_weight_cp, embed_flat_cp, embed_matrix_cp
-            else:
-                raise RuntimeError(f"❌ 致命錯誤：在權重庫中完全找不到任何包含 'embed_tokens' 的矩陣！")
+            evict_idx = (step - 1) % 3
+            load_idx = (step + 1) % 3
+            kv_queue = [(lid, k, v) for lid, k, v in kv_queue if lid not in groups[evict_idx]]
 
-            # ====================== 2. Transformer Layers ======================
+            for layer_idx in groups[load_idx]:
+                k_t, v_t = self.cacher.get_incremental_prefill_decompressed(layer_idx, start_window, end_window)
+                if k_t is not None and v_t is not None:
+                    kv_queue.append((layer_idx, k_t.to(self.device), v_t.to(self.device)))
+
+            kv_map = {lid: (k, v) for lid, k, v in kv_queue}
+            hidden_t = embed_w[next_token_id_t]
+
             for layer_idx in range(self.num_layers):
-                residual = hidden_cp
-                layer_key = f"{layer_idx}"
+                kv = kv_map.get(layer_idx)
+                if kv is None:
+                    k_t, v_t = self.cacher.get_incremental_prefill_decompressed(layer_idx, start_window, end_window)
+                    kv = (k_t.to(self.device), v_t.to(self.device)) if k_t is not None else None
 
-                # 【流式滑動視窗預載】：此時顯存中只有當前這 1 層的快取權重！
-                self.cacher.cache_single_layer(layer_idx)
-
-                # ---------- Input Layernorm ----------
-                ln_w = self.cacher.get(f"layers.{layer_idx}.input_layernorm.weight", layer_key, target_device=self.device)
-                hidden_cp = self.rms_norm(hidden_cp, ln_w)
-
-                # ---------- Attention (極速複用版) ----------
-                attn = self.attn_layers[layer_idx]
-                hidden_torch = self.to_torch(hidden_cp)
-                attn_output_torch, new_kv = attn.forward(
-                    self.loader, hidden_torch, 
-                    past_kv=self.kv_caches[layer_idx], 
-                    device=self.device
+                hidden_t, new_kv = apply_transformer_layer(
+                    layer_idx, hidden_t, self.loader, self.attention_layer, self.device, current_seq_len,
+                    raw_flat_kv=kv 
                 )
-                self.kv_caches[layer_idx] = new_kv
-                hidden_cp = residual + self.to_cupy(attn_output_torch)
-
-                # ---------- Post Attention Norm + MLP ----------
-                residual = hidden_cp
-                post_ln_w = self.cacher.get(f"layers.{layer_idx}.post_attention_layernorm.weight", layer_key, target_device=self.device)
-                normed_cp = self.rms_norm(hidden_cp, post_ln_w)
-
-                # === SwiGLU MLP (gate + up + down) ===
-                gate_flat = self.cacher.get(f"layers.{layer_idx}.mlp.gate_proj.weight", layer_key, target_device=self.device)
-                up_flat   = self.cacher.get(f"layers.{layer_idx}.mlp.up_proj.weight", layer_key, target_device=self.device)
-                down_flat = self.cacher.get(f"layers.{layer_idx}.mlp.down_proj.weight", layer_key, target_device=self.device)
-
-                # MLP 二維幾何自適應重塑
-                gate_cp = gate_flat.reshape(-1, normed_cp.shape[-1])
-                up_cp   = up_flat.reshape(-1, normed_cp.shape[-1])
-                down_cp = down_flat.reshape(-1, gate_cp.shape[0]) 
-
-                # 🚀 執行 GPU Tensor Cores 高速二維矩陣相乘
-                gate_linear = cp.matmul(normed_cp, gate_cp.T)
-                up_out      = cp.matmul(normed_cp, up_cp.T)
                 
-                # 🎯【終極修正】：拋棄複雜的 scipy 子模組依賴，直接用純原生 cp 算子手動熔煉數值穩定的 Sigmoid！
-                # 透過 cp.clip 防止 fp16 發生指數極端溢出，保證數值鋼鐵般的穩定度
-                # 數學本質完美的 SwiGLU 門控融合：SiLU(x) = x * Sigmoid(x)
-                sigmoid_gate = 1.0 / (1.0 + cp.exp(-cp.clip(gate_linear, -15.0, 15.0)))
-                gate_out = gate_linear * sigmoid_gate
-                
-                # 門控信號與升維信號在 GPU 內萬箭齊發、點對點交織 [Batch, SeqLen, 14336]
-                mlp_inter = gate_out * up_out
-                
-                # 單路降維壓回大腦初始維度 [Batch, SeqLen, 4096]
-                mlp_out = cp.matmul(mlp_inter, down_cp.T)
-                hidden_cp = residual + mlp_out
+                # In offload mode, the cacher must handle appending new states internally if it is saving dynamically.
 
-                # 徹底蒸發當前層的臨時大顯存，保持滑動視窗絕對淨空
-                self.cacher.clear_single_layer(layer_idx)
-                del gate_flat, up_flat, down_flat, gate_cp, up_cp, down_cp
-                del gate_linear, up_out, sigmoid_gate, gate_out, mlp_inter, mlp_out
+            hidden_norm = rms_norm(hidden_t, final_norm_w)
+            logits_t = torch.matmul(hidden_norm[:, -1:, :], lm_head_w.T)
 
-            # ====================== 3. Final Norm 動態加載 ======================
-            # 🎯【核心修正】：使用模糊搜索出來的 real_norm_name 進行加載
-            final_w = self.loader.get_matrix(real_norm_name, self.device)
-            if final_w is not None:
-                if hasattr(final_w, "contiguous"):
-                    final_w_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(final_w.contiguous()))
-                elif isinstance(final_w, cp.ndarray):
-                    final_w_cp = cp.ascontiguousarray(final_w)
-                else:
-                    final_w_cp = cp.ascontiguousarray(cp.asarray(final_w))
-                
-                hidden_cp = self.rms_norm(hidden_cp, final_w_cp)
-                del final_w, final_w_cp
+            next_token_id_t = sample_token(logits_t, vocab_size, special_ids)
+            token_id = int(next_token_id_t[0, 0])
+            print(self.tokenizer.decode([token_id]), end="", flush=True)
 
-            # ====================== 4. LM Head 動態加載 ======================
-            # 🎯【核心修正】：使用模糊搜索出來的 real_lm_head_name 進行加載
-            lm_head = self.loader.get_matrix(real_lm_head_name, self.device)
-            if lm_head is not None:
-                if hasattr(lm_head, "contiguous"):
-                    lm_head_cp = cp.from_dlpack(torch.utils.dlpack.to_dlpack(lm_head.contiguous()))
-                elif isinstance(lm_head, cp.ndarray):
-                    lm_head_cp = cp.ascontiguousarray(lm_head)
-                else:
-                    lm_head_cp = cp.ascontiguousarray(cp.asarray(lm_head))
-                
-                # 只對最後一個 token 計算預測概率
-                logits_cp = cp.matmul(hidden_cp[:, -1:, :], lm_head_cp.T)
-                next_token_id_cp = cp.argmax(logits_cp, axis=-1)
-                
-                # 輸出解碼文字
-                print(self.tokenizer.decode([int(next_token_id_cp[0, 0])]), end="", flush=True)
+            current_seq_len += 1
+            if token_id == self.tokenizer.eos_token_id:
+                break
 
-                # 更新下一輪的輸入 ID
-                current_input_ids_cp = next_token_id_cp
-                del lm_head, lm_head_cp, logits_cp
+    def _generate_no_cache(self, current_input_ids_t, current_seq_len, tensor_names):
+        embed_w = self._get_cached_weight(tensor_names["embed"])
+        final_norm_w = self._get_cached_weight(tensor_names["norm"])
+        lm_head_w = self._get_cached_weight(tensor_names["lm_head"])
+        vocab_size = self.tokenizer.vocab_size
+        special_ids = self._get_special_token_ids()
 
-        print("\n" + "─" * 80)
-        print("✅ JLLM 智能動態推理引擎解碼結束！")
+        for step in range(self.max_new_tokens):
+            hidden_t = embed_w[current_input_ids_t]
+
+            for layer_idx in range(self.num_layers):
+                hidden_t, _ = apply_transformer_layer(
+                    layer_idx, hidden_t, self.loader, self.attention_layer, self.device, current_seq_len
+                )
+
+            hidden_norm = rms_norm(hidden_t, final_norm_w)
+            logits_t = torch.matmul(hidden_norm[:, -1:, :], lm_head_w.T)
+
+            next_token_id_t = sample_token(logits_t, vocab_size, special_ids)
+            token_id = int(next_token_id_t[0, 0])
+            print(self.tokenizer.decode([token_id]), end="", flush=True)
+
+            current_input_ids_t = torch.cat([current_input_ids_t, next_token_id_t], dim=-1)
+            current_seq_len += 1
+
+            if token_id == self.tokenizer.eos_token_id:
+                break
+
+    def _generate_cell_level(self, current_input_ids_t, current_seq_len, tensor_names):
+        """Cell-Level Generation: One token at a time with cached KV states.
+
+        Prefill: uses sequence-level apply_transformer_layer (correct RoPE for all tokens).
+        Decode:  uses cell-level transformer_layer_forward_cell (one token at a time).
+        """
+        embed_w = self._get_cached_weight(tensor_names["embed"])
+        final_norm_w = self._get_cached_weight(tensor_names["norm"])
+        lm_head_w = self._get_cached_weight(tensor_names["lm_head"])
+
+        vocab_size = self.tokenizer.vocab_size
+        special_ids = self._get_special_token_ids()
+
+        # Pre-compute RoPE frequencies once (used in decode phase only)
+        rope_freqs = compute_rope_freqs_cell(
+            self.attention_layer.head_dim,
+            self.attention_layer.rope_theta,
+            self.device
+        )
+
+        # ===== PREFILL PHASE (sequence-level, correct RoPE for all tokens) =====
+        hidden_t = embed_w[current_input_ids_t]
+
+        kv_caches = {}
+        for layer_idx in range(self.num_layers):
+            hidden_t, new_kv = apply_transformer_layer(
+                layer_idx, hidden_t, self.loader, self.attention_layer, self.device, current_seq_len
+            )
+            kv_caches[layer_idx] = (new_kv[0].contiguous(), new_kv[1].contiguous())
+
+        # Final norm + logits + first token
+        hidden_norm = rms_norm(hidden_t, final_norm_w)
+        logits_t = torch.matmul(hidden_norm[:, -1:, :], lm_head_w.T)
+        next_token_id_t = sample_token(logits_t, vocab_size, special_ids)
+        token_id = int(next_token_id_t[0, 0])
+        generated_tokens = [token_id]
+        print(self.tokenizer.decode([token_id]), end="", flush=True)
+
+        # ===== DECODE PHASE (cell-level, one token at a time) =====
+        for step in range(self.max_new_tokens - 1):
+            current_seq_len += 1
+            current_position = current_seq_len - 1  # position of the new token
+
+            # Embed single new token
+            hidden_t = embed_w[next_token_id_t]
+
+            for layer_idx in range(self.num_layers):
+                input_ln_w = self.loader.get_matrix(
+                    f"layers.{layer_idx}.input_layernorm.weight", target_device=self.device
+                )
+                post_ln_w = self.loader.get_matrix(
+                    f"layers.{layer_idx}.post_attention_layernorm.weight", target_device=self.device
+                )
+                q_proj = self.loader.get_matrix(
+                    f"layers.{layer_idx}.self_attn.q_proj.weight", target_device=self.device
+                )
+                k_proj = self.loader.get_matrix(
+                    f"layers.{layer_idx}.self_attn.k_proj.weight", target_device=self.device
+                )
+                v_proj = self.loader.get_matrix(
+                    f"layers.{layer_idx}.self_attn.v_proj.weight", target_device=self.device
+                )
+                o_proj = self.loader.get_matrix(
+                    f"layers.{layer_idx}.self_attn.o_proj.weight", target_device=self.device
+                )
+                gate_proj = self.loader.get_matrix(
+                    f"layers.{layer_idx}.mlp.gate_proj.weight", target_device=self.device
+                )
+                up_proj = self.loader.get_matrix(
+                    f"layers.{layer_idx}.mlp.up_proj.weight", target_device=self.device
+                )
+                down_proj = self.loader.get_matrix(
+                    f"layers.{layer_idx}.mlp.down_proj.weight", target_device=self.device
+                )
+
+                history_k, history_v = kv_caches[layer_idx]
+                residual = hidden_t
+
+                hidden_t, k_full, v_full = transformer_layer_forward_cell(
+                    hidden_cell=hidden_t,
+                    residual=residual,
+                    q_proj=q_proj, k_proj=k_proj, v_proj=v_proj, o_proj=o_proj,
+                    gate_proj=gate_proj, up_proj=up_proj, down_proj=down_proj,
+                    input_layernorm_weight=input_ln_w,
+                    post_attention_layernorm_weight=post_ln_w,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    head_dim=self.attention_layer.head_dim,
+                    k_cache_cell=history_k,
+                    v_cache_cell=history_v,
+                    rope_freqs=rope_freqs,
+                    current_position=current_position
+                )
+                kv_caches[layer_idx] = (k_full.contiguous(), v_full.contiguous())
+
+            hidden_norm = rms_norm(hidden_t, final_norm_w)
+            logits_t = torch.matmul(hidden_norm, lm_head_w.T)
+            next_token_id_t = sample_token(logits_t, vocab_size, special_ids)
+            token_id = int(next_token_id_t[0, 0])
+
+            if token_id == self.tokenizer.eos_token_id:
+                break
+
+            generated_tokens.append(token_id)
+            print(self.tokenizer.decode([token_id]), end="", flush=True)
